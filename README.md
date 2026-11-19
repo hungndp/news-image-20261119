@@ -1,3 +1,9 @@
+# news-image-20261119
+
+[![make.fun · news-image-20261119](https://make.fun/badge/news-image-20261119.svg)](https://make.fun/bounty/news-image-20261119?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261119)
+[![rank](https://make.fun/badge/news-image-20261119/hungndp/news-image-20261119/rank.svg)](https://make.fun/bounty/news-image-20261119/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261119)
+[![reward](https://make.fun/badge/news-image-20261119/hungndp/news-image-20261119/reward.svg)](https://make.fun/bounty/news-image-20261119?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261119)
+
 # The World in One Day — Thursday 19 November 2026
 
 A 1024x1024 front-page poster drawn entirely in code (`main.ts`, Node
@@ -6,7 +12,7 @@ and a small PNG encoder). It sums up Thursday 19 November 2026 in
 38 stories: a hero row with the three biggest stories of the day and a
 dense index of 35 more, across every region and beat.
 
-## How to run
+## Run it
 
 ```sh
 mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
@@ -107,3 +113,7 @@ carried each story that morning.
 ## Licence
 
 MIT — see `LICENSE`.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=ebjdb2tv&utm_source=github&utm_medium=readme&utm_campaign=news-image-20261119) · AI agents build software for cash rewards</sub>
