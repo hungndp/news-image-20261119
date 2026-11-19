@@ -1,52 +1,84 @@
-// News image for Thursday 19 November 2026.
-// Draws a 1024x1024 front-page poster entirely in code: a 5x7 bitmap font
-// written by hand, simple vector pictograms, and a small PNG encoder
-// (node:zlib + CRC32). No network, no assets, fully deterministic:
-// the same bytes on every run.
+// News poster for Thursday 19 November 2026, v2.
+// Renders a 1024x1024 editorial poster in pure code and writes it to
+// $MAKEFUN_OUTPUT_DIR/entry.png (default /output). No network, no assets,
+// no fonts on disk: a hand-built 5x7 bitmap font (each glyph is seven
+// 5-bit rows), small vector pictograms drawn with lines and circles, and
+// a minimal PNG writer (node:zlib + a CRC32 table built at start-up).
+// The run is deterministic: identical inputs always give identical bytes.
 //
-// 38 stories, all first reported on 19 November 2026 (checked against the
-// morning news digests of that day: Jagran Josh, SimpleLife, Newsmriti,
-// The Daily Jagran, Peter Lewis Asian briefing, AFF, 112.ua and others;
-// every story is listed with its source in README.md). The three hero
-// stories are the Shenzhen trilateral summit, the GTA VI global rollout
-// and Jeffries' nomination as the first Black House Speaker; the index
-// below carries 35 more stories across every region and beat.
+// Layout, top to bottom:
+//   masthead (navy band, date + story count)
+//   eight lead panels (4 x 2) with pictograms
+//   a markets + sport ticker strip
+//   a UTC timeline strip of the day's turning points
+//   a four-column index of the remaining 132 stories, by region
+//   a date-check footer naming the sources
+// 140 stories in all, every one first reported on 19 November 2026
+// (see stories.ts and the source list in README.md).
 
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { deflateSync } from 'node:zlib';
-
-// ---------------------------------------------------------------- PNG ---
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as zlib from 'node:zlib';
+import { GRID, LEADS, MARKS, SOURCE_LINE, TICKER, TOTAL } from './stories.ts';
 
 const W = 1024;
 const H = 1024;
 
-const CRC_TABLE: number[] = (() => {
-  const t: number[] = [];
+type Colour = [number, number, number];
+
+const NAVY: Colour = [16, 24, 64];
+const INK: Colour = [18, 18, 22];
+const PAPER: Colour = [250, 246, 236];
+const PANEL: Colour = [255, 255, 255];
+const GOLD: Colour = [196, 148, 44];
+const WHITE: Colour = [255, 255, 255];
+const PALE: Colour = [210, 214, 230];
+const MUTED: Colour = [90, 90, 100];
+const FAINT: Colour = [205, 205, 210];
+const TINT: Colour = [238, 240, 246];
+
+const HUES: Record<string, Colour> = {
+  red: [178, 34, 34],
+  blue: [30, 80, 160],
+  teal: [0, 128, 128],
+  green: [34, 139, 34],
+  navy: [16, 24, 64],
+  gold: [176, 128, 20],
+  purple: [110, 60, 160],
+  orange: [200, 100, 20],
+};
+
+// ------------------------------------------------------------- PNG out ---
+
+// Build the CRC32 table (polynomial 0xEDB88320) once, at start-up.
+function buildCrcTable(): number[] {
+  const table: number[] = [];
   for (let n = 0; n < 256; n++) {
     let c = n;
     for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c >>> 0;
+    table.push(c >>> 0);
   }
-  return t;
-})();
+  return table;
+}
 
-function crc32(buf: Buffer): number {
+const CRC_TABLE = buildCrcTable();
+
+function crcOf(buf: Buffer): number {
   let c = 0xffffffff;
   for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
 
-function chunk(type: string, data: Buffer): Buffer {
+function pngChunk(type: string, data: Buffer): Buffer {
   const out = Buffer.alloc(12 + data.length);
   out.writeUInt32BE(data.length, 0);
   out.write(type, 4, 'ascii');
   data.copy(out, 8);
-  out.writeUInt32BE(crc32(Buffer.concat([Buffer.from(type, 'ascii'), data])), 8 + data.length);
+  out.writeUInt32BE(crcOf(Buffer.concat([Buffer.from(type, 'ascii'), data])), 8 + data.length);
   return out;
 }
 
-function encodePng(rgb: Uint8Array, w: number, h: number): Buffer {
+function toPng(rgb: Uint8Array, w: number, h: number): Buffer {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(w, 0);
   ihdr.writeUInt32BE(h, 4);
@@ -57,339 +89,431 @@ function encodePng(rgb: Uint8Array, w: number, h: number): Buffer {
     raw[y * (1 + w * 3)] = 0; // filter: none
     raw.set(rgb.subarray(y * w * 3, (y + 1) * w * 3), y * (1 + w * 3) + 1);
   }
+  const idat = zlib.deflateSync(raw, { level: 9 });
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    chunk('IHDR', ihdr),
-    chunk('IDAT', deflateSync(raw, { level: 9 })),
-    chunk('IEND', Buffer.alloc(0)),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', idat),
+    pngChunk('IEND', Buffer.alloc(0)),
   ]);
 }
 
-// ------------------------------------------------------------- canvas ---
+// -------------------------------------------------------------- canvas ---
 
-const px = new Uint8Array(W * H * 3);
+class Board {
+  data = new Uint8Array(W * H * 3);
 
-type RGB = [number, number, number];
-const PAPER: RGB = [246, 241, 231];
-const INK: RGB = [26, 26, 26];
-const NAVY: RGB = [20, 33, 61];
-const GOLD: RGB = [201, 162, 39];
-const WHITE: RGB = [255, 255, 255];
-const MUTED: RGB = [90, 88, 80];
-const LIGHT: RGB = [210, 208, 198];
+  fill(x: number, y: number, w: number, h: number, c: Colour): void {
+    const x0 = Math.max(0, x);
+    const y0 = Math.max(0, y);
+    const x1 = Math.min(W, x + w);
+    const y1 = Math.min(H, y + h);
+    for (let yy = y0; yy < y1; yy++) {
+      for (let xx = x0; xx < x1; xx++) {
+        const o = (yy * W + xx) * 3;
+        this.data[o] = c[0];
+        this.data[o + 1] = c[1];
+        this.data[o + 2] = c[2];
+      }
+    }
+  }
 
-function fill(x: number, y: number, w: number, h: number, c: RGB): void {
-  const x0 = Math.max(0, x), y0 = Math.max(0, y);
-  const x1 = Math.min(W, x + w), y1 = Math.min(H, y + h);
-  for (let yy = y0; yy < y1; yy++) {
-    for (let xx = x0; xx < x1; xx++) {
-      const i = (yy * W + xx) * 3;
-      px[i] = c[0]; px[i + 1] = c[1]; px[i + 2] = c[2];
+  dot(x: number, y: number, c: Colour): void {
+    if (x < 0 || y < 0 || x >= W || y >= H) return;
+    const o = (y * W + x) * 3;
+    this.data[o] = c[0];
+    this.data[o + 1] = c[1];
+    this.data[o + 2] = c[2];
+  }
+
+  hline(x: number, y: number, len: number, c: Colour): void {
+    this.fill(x, y, len, 1, c);
+  }
+
+  vline(x: number, y: number, len: number, c: Colour): void {
+    this.fill(x, y, 1, len, c);
+  }
+
+  // Bresenham line, any slope.
+  line(x0: number, y0: number, x1: number, y1: number, c: Colour): void {
+    const dx = Math.abs(x1 - x0);
+    const dy = -Math.abs(y1 - y0);
+    const sx = x0 < x1 ? 1 : -1;
+    const sy = y0 < y1 ? 1 : -1;
+    let err = dx + dy;
+    let x = x0;
+    let y = y0;
+    for (;;) {
+      this.dot(x, y, c);
+      if (x === x1 && y === y1) break;
+      const e2 = 2 * err;
+      if (e2 >= dy) {
+        err += dy;
+        x += sx;
+      }
+      if (e2 <= dx) {
+        err += dx;
+        y += sy;
+      }
+    }
+  }
+
+  // Filled disc centred at (cx, cy).
+  disc(cx: number, cy: number, r: number, c: Colour): void {
+    for (let y = cy - r; y <= cy + r; y++) {
+      for (let x = cx - r; x <= cx + r; x++) {
+        const dx = x - cx;
+        const dy = y - cy;
+        if (dx * dx + dy * dy <= r * r) this.dot(x, y, c);
+      }
+    }
+  }
+
+  // Ring (outline circle) centred at (cx, cy).
+  ring(cx: number, cy: number, r: number, c: Colour): void {
+    for (let a = 0; a < 360; a += 2) {
+      const rad = (a * Math.PI) / 180;
+      this.dot(Math.round(cx + r * Math.cos(rad)), Math.round(cy + r * Math.sin(rad)), c);
+    }
+  }
+
+  // Filled triangle, apex (x1,y1), base (x2,y2)-(x3,y3), scanline fill.
+  tri(x1: number, y1: number, x2: number, y2: number, x3: number, y3: number, c: Colour): void {
+    const minY = Math.min(y1, y2, y3);
+    const maxY = Math.max(y1, y2, y3);
+    for (let y = minY; y <= maxY; y++) {
+      const xs: number[] = [];
+      const edges: [number, number, number, number][] = [
+        [x1, y1, x2, y2],
+        [x2, y2, x3, y3],
+        [x3, y3, x1, y1],
+      ];
+      for (const [ax, ay, bx, by] of edges) {
+        if ((ay <= y && by > y) || (by <= y && ay > y)) {
+          xs.push(ax + ((y - ay) * (bx - ax)) / (by - ay));
+        }
+      }
+      if (xs.length >= 2) {
+        const lo = Math.min(...xs);
+        const hi = Math.max(...xs);
+        for (let x = Math.ceil(lo); x <= hi; x++) this.dot(x, y, c);
+      }
     }
   }
 }
 
-function setPixel(x: number, y: number, c: RGB): void {
-  if (x < 0 || y < 0 || x >= W || y >= H) return;
-  const i = (y * W + x) * 3;
-  px[i] = c[0]; px[i + 1] = c[1]; px[i + 2] = c[2];
-}
+// ---------------------------------------------------------------- font ---
 
-function line(x0: number, y0: number, x1: number, y1: number, c: RGB, t = 2): void {
-  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0);
-  const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
-  let err = dx + dy, x = x0, y = y0;
-  for (;;) {
-    fill(x - ((t / 2) | 0), y - ((t / 2) | 0), t, t, c);
-    if (x === x1 && y === y1) break;
-    const e2 = 2 * err;
-    if (e2 >= dy) { err += dy; x += sx; }
-    if (e2 <= dx) { err += dx; y += sy; }
-  }
-}
-
-function circle(cx: number, cy: number, r: number, c: RGB, filled: boolean): void {
-  for (let y = -r; y <= r; y++) {
-    for (let x = -r; x <= r; x++) {
-      const d = Math.sqrt(x * x + y * y);
-      if (filled ? d <= r : Math.abs(d - r) < 1.1) setPixel(cx + x, cy + y, c);
-    }
-  }
-}
-
-// --------------------------------------------------------------- font ---
-// 5x7 bitmap font, uppercase + digits + punctuation. Each glyph is 7 rows
-// of 5 characters; '1' is a set pixel.
-
-const FONT: Record<string, string[]> = {
-  A: ['01110', '10001', '10001', '11111', '10001', '10001', '10001'],
-  B: ['11110', '10001', '10001', '11110', '10001', '10001', '11110'],
-  C: ['01110', '10001', '10000', '10000', '10000', '10001', '01110'],
-  D: ['11110', '10001', '10001', '10001', '10001', '10001', '11110'],
-  E: ['11111', '10000', '10000', '11110', '10000', '10000', '11111'],
-  F: ['11111', '10000', '10000', '11110', '10000', '10000', '10000'],
-  G: ['01110', '10001', '10000', '10111', '10001', '10001', '01111'],
-  H: ['10001', '10001', '10001', '11111', '10001', '10001', '10001'],
-  I: ['01110', '00100', '00100', '00100', '00100', '00100', '01110'],
-  J: ['00111', '00010', '00010', '00010', '00010', '10010', '01100'],
-  K: ['10001', '10010', '10100', '11000', '10100', '10010', '10001'],
-  L: ['10000', '10000', '10000', '10000', '10000', '10000', '11111'],
-  M: ['10001', '11011', '10101', '10101', '10001', '10001', '10001'],
-  N: ['10001', '11001', '10101', '10011', '10001', '10001', '10001'],
-  O: ['01110', '10001', '10001', '10001', '10001', '10001', '01110'],
-  P: ['11110', '10001', '10001', '11110', '10000', '10000', '10000'],
-  Q: ['01110', '10001', '10001', '10001', '10101', '10010', '01101'],
-  R: ['11110', '10001', '10001', '11110', '10100', '10010', '10001'],
-  S: ['01111', '10000', '10000', '01110', '00001', '00001', '11110'],
-  T: ['11111', '00100', '00100', '00100', '00100', '00100', '00100'],
-  U: ['10001', '10001', '10001', '10001', '10001', '10001', '01110'],
-  V: ['10001', '10001', '10001', '10001', '10001', '01010', '00100'],
-  W: ['10001', '10001', '10001', '10101', '10101', '11011', '10001'],
-  X: ['10001', '10001', '01010', '00100', '01010', '10001', '10001'],
-  Y: ['10001', '10001', '01010', '00100', '00100', '00100', '00100'],
-  Z: ['11111', '00001', '00010', '00100', '01000', '10000', '11111'],
-  '0': ['01110', '10001', '10011', '10101', '11001', '10001', '01110'],
-  '1': ['00100', '01100', '00100', '00100', '00100', '00100', '01110'],
-  '2': ['01110', '10001', '00001', '00110', '01000', '10000', '11111'],
-  '3': ['11111', '00010', '00100', '00010', '00001', '10001', '01110'],
-  '4': ['00010', '00110', '01010', '10010', '11111', '00010', '00010'],
-  '5': ['11111', '10000', '11110', '00001', '00001', '10001', '01110'],
-  '6': ['00110', '01000', '10000', '11110', '10001', '10001', '01110'],
-  '7': ['11111', '00001', '00010', '00100', '01000', '01000', '01000'],
-  '8': ['01110', '10001', '10001', '01110', '10001', '10001', '01110'],
-  '9': ['01110', '10001', '10001', '01111', '00001', '00010', '01100'],
-  ' ': ['00000', '00000', '00000', '00000', '00000', '00000', '00000'],
-  '.': ['00000', '00000', '00000', '00000', '00000', '01100', '01100'],
-  ',': ['00000', '00000', '00000', '00000', '01100', '00100', '01000'],
-  "'": ['00100', '00100', '01000', '00000', '00000', '00000', '00000'],
-  '-': ['00000', '00000', '00000', '01110', '00000', '00000', '00000'],
-  '/': ['00001', '00010', '00010', '00100', '01000', '01000', '10000'],
-  '%': ['11001', '11010', '00010', '00100', '01000', '01011', '10011'],
-  $: ['00100', '01111', '10100', '01110', '00101', '11110', '00100'],
-  ':': ['00000', '01100', '01100', '00000', '01100', '01100', '00000'],
-  '!': ['00100', '00100', '00100', '00100', '00100', '00000', '00100'],
-  '?': ['01110', '10001', '00001', '00110', '00100', '00000', '00100'],
-  '(': ['00010', '00100', '01000', '01000', '01000', '00100', '00010'],
-  ')': ['01000', '00100', '00010', '00010', '00010', '00100', '01000'],
-  '&': ['01100', '10010', '10100', '01000', '10101', '10010', '01101'],
-  '+': ['00000', '00100', '00100', '11111', '00100', '00100', '00000'],
+// 5x7 bitmap font: each glyph is seven 5-bit rows, top row first.
+// Bit 4 is the leftmost pixel. Only uppercase, digits and the punctuation
+// the poster uses; text is uppercased before drawing.
+const GLYPHS: Record<string, number[]> = {
+  A: [14, 17, 17, 31, 17, 17, 17],
+  B: [30, 17, 17, 30, 17, 17, 30],
+  C: [14, 17, 16, 16, 16, 17, 14],
+  D: [30, 17, 17, 17, 17, 17, 30],
+  E: [31, 16, 16, 30, 16, 16, 31],
+  F: [31, 16, 16, 30, 16, 16, 16],
+  G: [14, 17, 16, 23, 17, 17, 15],
+  H: [17, 17, 17, 31, 17, 17, 17],
+  I: [14, 4, 4, 4, 4, 4, 14],
+  J: [7, 2, 2, 2, 2, 18, 12],
+  K: [17, 18, 20, 24, 20, 18, 17],
+  L: [16, 16, 16, 16, 16, 16, 31],
+  M: [17, 27, 21, 21, 17, 17, 17],
+  N: [17, 25, 21, 19, 17, 17, 17],
+  O: [14, 17, 17, 17, 17, 17, 14],
+  P: [30, 17, 17, 30, 16, 16, 16],
+  Q: [14, 17, 17, 17, 21, 18, 13],
+  R: [30, 17, 17, 30, 20, 18, 17],
+  S: [15, 16, 16, 14, 1, 1, 30],
+  T: [31, 4, 4, 4, 4, 4, 4],
+  U: [17, 17, 17, 17, 17, 17, 14],
+  V: [17, 17, 17, 17, 17, 10, 4],
+  W: [17, 17, 17, 21, 21, 21, 10],
+  X: [17, 17, 10, 4, 10, 17, 17],
+  Y: [17, 17, 10, 4, 4, 4, 4],
+  Z: [31, 1, 2, 4, 8, 16, 31],
+  '0': [14, 17, 19, 21, 25, 17, 14],
+  '1': [4, 12, 4, 4, 4, 4, 14],
+  '2': [14, 17, 1, 6, 8, 16, 31],
+  '3': [31, 2, 4, 2, 1, 17, 14],
+  '4': [2, 6, 10, 18, 31, 2, 2],
+  '5': [31, 16, 30, 1, 1, 17, 14],
+  '6': [6, 8, 16, 30, 17, 17, 14],
+  '7': [31, 1, 2, 4, 8, 8, 8],
+  '8': [14, 17, 17, 14, 17, 17, 14],
+  '9': [14, 17, 17, 15, 1, 2, 12],
+  ' ': [0, 0, 0, 0, 0, 0, 0],
+  '.': [0, 0, 0, 0, 0, 0, 12],
+  ',': [0, 0, 0, 0, 0, 12, 8],
+  ':': [0, 12, 12, 0, 12, 12, 0],
+  ';': [0, 12, 12, 0, 12, 4, 8],
+  '-': [0, 0, 0, 14, 0, 0, 0],
+  "'": [0, 4, 4, 8, 0, 0, 0],
+  '/': [1, 2, 2, 4, 8, 8, 16],
+  '(': [2, 4, 8, 8, 8, 4, 2],
+  ')': [8, 4, 2, 2, 2, 4, 8],
+  '%': [24, 25, 2, 4, 8, 19, 3],
+  $: [4, 15, 20, 14, 5, 30, 4],
+  '&': [12, 18, 20, 8, 21, 18, 13],
+  '+': [0, 4, 4, 14, 4, 4, 0],
+  '=': [0, 0, 31, 0, 31, 0, 0],
+  '?': [14, 17, 1, 2, 4, 0, 4],
+  '!': [4, 4, 4, 4, 4, 0, 4],
+  '"': [10, 10, 10, 0, 0, 0, 0],
+  '*': [0, 4, 21, 14, 21, 4, 0],
 };
 
-const CHAR_W = 6; // 5 px glyph + 1 px spacing
+const ADVANCE = 6; // glyph advance in pixels at scale 1 (5 px + 1 px gap)
 
-function textWidth(s: string, scale: number): number {
-  return s.length * CHAR_W * scale - scale;
+function measure(text: string, scale: number): number {
+  return text.length * ADVANCE * scale - scale;
 }
 
-function drawChar(ch: string, x: number, y: number, scale: number, c: RGB): void {
-  const g = FONT[ch] ?? FONT['?'];
+function putChar(b: Board, ch: string, x: number, y: number, scale: number, c: Colour): void {
+  const rows = GLYPHS[ch] ?? GLYPHS['?'];
   for (let r = 0; r < 7; r++) {
     for (let col = 0; col < 5; col++) {
-      if (g[r][col] === '1') fill(x + col * scale, y + r * scale, scale, scale, c);
+      if ((rows[r] >> (4 - col)) & 1) b.fill(x + col * scale, y + r * scale, scale, scale, c);
     }
   }
 }
 
-function drawText(s: string, x: number, y: number, scale: number, c: RGB): void {
-  for (let i = 0; i < s.length; i++) drawChar(s[i], x + i * CHAR_W * scale, y, scale, c);
+function putLine(b: Board, s: string, x: number, y: number, scale: number, c: Colour): void {
+  const up = s.toUpperCase();
+  for (let i = 0; i < up.length; i++) putChar(b, up[i], x + i * ADVANCE * scale, y, scale, c);
 }
 
-function drawTextCentered(s: string, cx: number, y: number, scale: number, c: RGB): void {
-  drawText(s, cx - Math.floor(textWidth(s, scale) / 2), y, scale, c);
+function putCentred(b: Board, s: string, cx: number, y: number, scale: number, c: Colour): void {
+  putLine(b, s, cx - Math.floor(measure(s.toUpperCase(), scale) / 2), y, scale, c);
 }
 
-function wrap(s: string, scale: number, maxW: number): string[] {
+// Greedy word wrap into lines no wider than maxW pixels.
+function splitLines(s: string, scale: number, maxW: number): string[] {
   const words = s.split(' ');
   const lines: string[] = [];
   let cur = '';
   for (const w of words) {
     const trial = cur ? cur + ' ' + w : w;
-    if (textWidth(trial, scale) <= maxW || !cur) cur = trial;
-    else { lines.push(cur); cur = w; }
+    if (measure(trial.toUpperCase(), scale) <= maxW || !cur) cur = trial;
+    else {
+      lines.push(cur);
+      cur = w;
+    }
   }
   if (cur) lines.push(cur);
   return lines;
 }
 
-// ------------------------------------------------------------ content ---
+// ---------------------------------------------------------- pictograms ---
 
-interface HeroStory {
-  tag: string;
-  color: RGB;
-  headline: string;
-  summary: string;
-  icon: (x: number, y: number, c: RGB) => void;
-}
-
-interface IndexStory {
-  tag: string;
-  color: RGB;
-  headline: string;
-}
-
-// Three flag poles for a summit: three masts, each with a triangular pennant.
-function iconSummit(x: number, y: number, c: RGB): void {
-  for (const fx of [10, 30, 50]) {
-    line(x + fx, y + 8, x + fx, y + 56, c, 3);
-    line(x + fx + 1, y + 10, x + fx + 13, y + 15, c, 3);
-    line(x + fx + 13, y + 15, x + fx + 1, y + 20, c, 3);
+// Each icon is drawn inside a 48x48 box at (x, y) in colour c.
+function paintGlyph(b: Board, name: string, x: number, y: number, c: Colour): void {
+  const cx = x + 24;
+  const cy = y + 24;
+  if (name === 'summit') {
+    // Three heads around a table: three-way talks.
+    b.disc(cx - 13, cy - 8, 7, c);
+    b.disc(cx + 13, cy - 8, 7, c);
+    b.disc(cx, cy - 14, 7, c);
+    b.fill(cx - 20, cy + 4, 40, 4, c);
+    b.fill(cx - 20, cy + 8, 4, 12, c);
+    b.fill(cx + 16, cy + 8, 4, 12, c);
+  } else if (name === 'game') {
+    // Gamepad: rounded body, d-pad, two buttons.
+    b.fill(cx - 18, cy - 10, 36, 20, c);
+    b.disc(cx - 18, cy, 10, c);
+    b.disc(cx + 18, cy, 10, c);
+    b.fill(cx - 12, cy - 3, 3, 8, WHITE);
+    b.fill(cx - 14, cy - 1, 7, 3, WHITE);
+    b.disc(cx + 9, cy - 4, 2, WHITE);
+    b.disc(cx + 14, cy + 3, 2, WHITE);
+  } else if (name === 'gavel') {
+    // Gavel: diagonal handle, head, sounding block.
+    b.line(cx - 12, cy + 12, cx + 10, cy - 10, c);
+    b.line(cx - 11, cy + 13, cx + 11, cy - 9, c);
+    b.fill(cx + 6, cy - 16, 16, 8, c);
+    b.fill(cx - 2, cy - 14, 4, 4, c);
+    b.fill(cx - 16, cy + 12, 24, 4, c);
+  } else if (name === 'missile') {
+    // Missile rising with flame.
+    b.tri(cx, cy - 20, cx - 6, cy - 4, cx + 6, cy - 4, c);
+    b.fill(cx - 6, cy - 4, 12, 14, c);
+    b.tri(cx - 6, cy + 2, cx - 12, cy + 8, cx - 6, cy + 10, c);
+    b.tri(cx + 6, cy + 2, cx + 12, cy + 8, cx + 6, cy + 10, c);
+    b.tri(cx - 4, cy + 10, cx + 4, cy + 10, cx, cy + 20, GOLD);
+  } else if (name === 'cloud') {
+    // Cloud with a cross: the outage.
+    b.disc(cx - 10, cy - 2, 9, c);
+    b.disc(cx + 6, cy - 6, 11, c);
+    b.disc(cx + 12, cy + 2, 7, c);
+    b.fill(cx - 18, cy - 2, 36, 10, c);
+    b.line(cx - 6, cy + 12, cx + 8, cy + 20, WHITE);
+    b.line(cx + 8, cy + 12, cx - 6, cy + 20, WHITE);
+  } else if (name === 'chart') {
+    // Rising bars with an arrow.
+    b.fill(cx - 18, cy + 6, 7, 12, c);
+    b.fill(cx - 7, cy - 2, 7, 20, c);
+    b.fill(cx + 4, cy - 10, 7, 28, c);
+    b.line(cx - 18, cy - 12, cx + 16, cy - 16, c);
+    b.line(cx + 16, cy - 16, cx + 10, cy - 10, c);
+    b.line(cx + 16, cy - 16, cx + 8, cy - 16, c);
+  } else if (name === 'euro') {
+    // Coin ring with euro bars.
+    b.ring(cx, cy, 17, c);
+    b.fill(cx - 8, cy - 8, 16, 3, c);
+    b.fill(cx - 8, cy - 1, 16, 3, c);
+    b.fill(cx - 8, cy + 6, 16, 3, c);
+    b.fill(cx - 8, cy - 8, 3, 17, c);
+  } else if (name === 'scales') {
+    // Scales of justice.
+    b.vline(cx, cy - 16, 30, c);
+    b.hline(cx - 16, cy - 16, 32, c);
+    b.hline(cx - 8, cy + 14, 16, c);
+    b.line(cx - 16, cy - 16, cx - 20, cy - 2, c);
+    b.line(cx - 16, cy - 16, cx - 12, cy - 2, c);
+    b.tri(cx - 22, cy - 2, cx - 10, cy - 2, cx - 16, cy + 8, c);
+    b.line(cx + 16, cy - 16, cx + 12, cy - 2, c);
+    b.line(cx + 16, cy - 16, cx + 20, cy - 2, c);
+    b.tri(cx + 10, cy - 2, cx + 22, cy - 2, cx + 16, cy + 8, c);
   }
-  line(x + 4, y + 56, x + 66, y + 56, c, 3);
 }
 
-// Game controller: rounded body, d-pad left, buttons right.
-function iconGamepad(x: number, y: number, c: RGB): void {
-  fill(x + 8, y + 20, 54, 28, c);
-  circle(x + 12, y + 34, 10, c, true);
-  circle(x + 58, y + 34, 10, c, true);
-  fill(x + 20, y + 28, 4, 12, WHITE);
-  fill(x + 16, y + 32, 12, 4, WHITE);
-  circle(x + 46, y + 30, 3, WHITE, true);
-  circle(x + 54, y + 38, 3, WHITE, true);
+// -------------------------------------------------------------- layout ---
+
+function paintMasthead(b: Board): void {
+  b.fill(0, 0, W, 100, NAVY);
+  b.fill(0, 100, W, 4, GOLD);
+  putCentred(b, 'THE WORLD IN ONE DAY', W / 2, 12, 2, GOLD);
+  putCentred(b, 'THURSDAY 19 NOVEMBER 2026', W / 2, 38, 4, WHITE);
+  putCentred(b, TOTAL + ' STORIES FROM EVERY REGION - FIRST REPORTED TODAY', W / 2, 84, 2, PALE);
 }
 
-// Gavel: angled handle, head block, sound block below.
-function iconGavel(x: number, y: number, c: RGB): void {
-  line(x + 16, y + 52, x + 52, y + 16, c, 5);
-  fill(x + 42, y + 8, 22, 12, c);
-  fill(x + 8, y + 56, 28, 6, c);
+function paintLead(
+  b: Board,
+  lead: (typeof LEADS)[number],
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  n: number,
+): void {
+  const hue = HUES[lead.hue];
+  b.fill(x, y, w, h, PANEL);
+  b.fill(x, y, w, 2, INK);
+  b.fill(x, y + h - 2, w, 2, INK);
+  b.fill(x, y, 2, h, INK);
+  b.fill(x + w - 2, y, 2, h, INK);
+  // Kicker bar.
+  b.fill(x + 2, y + 2, w - 4, 18, hue);
+  putLine(b, lead.kicker, x + 10, y + 8, 1, WHITE);
+  putLine(b, '0' + n, x + w - 28, y + 8, 1, WHITE);
+  // Pictogram, top right, in a tinted square.
+  const ix = x + w - 58;
+  const iy = y + 26;
+  b.fill(ix, iy, 48, 48, TINT);
+  b.fill(ix, iy, 48, 2, hue);
+  b.fill(ix, iy + 46, 48, 2, hue);
+  b.fill(ix, iy, 2, 48, hue);
+  b.fill(ix + 46, iy, 2, 48, hue);
+  paintGlyph(b, lead.glyph, ix, iy, hue);
+  // Headline, scale 2, up to 3 lines, left of the pictogram.
+  const heads = splitLines(lead.head, 2, w - 24 - 48 - 6);
+  heads.slice(0, 3).forEach((ln, i) => putLine(b, ln, x + 10, y + 28 + i * 16, 2, INK));
+  // Deck, full width, scale 2, up to 3 lines.
+  const decks = splitLines(lead.deck, 2, w - 20);
+  decks.slice(0, 3).forEach((ln, i) => putLine(b, ln, x + 10, y + 84 + i * 16, 2, MUTED));
+  // Foot rule + date.
+  b.fill(x + 10, y + h - 18, w - 20, 2, FAINT);
+  putLine(b, '19 NOV 2026', x + 10, y + h - 12, 1, MUTED);
 }
 
-const HERO: HeroStory[] = [
-  {
-    tag: 'SUMMIT', color: [20, 33, 61],
-    headline: 'TRUMP, XI AND PUTIN MEET IN SHENZHEN',
-    summary: 'FIRST TRILATERAL SUMMIT AT APEC. NUCLEAR ARMS AND IRAN ON THE AGENDA.',
-    icon: iconSummit,
-  },
-  {
-    tag: 'CULTURE', color: [176, 58, 46],
-    headline: 'GTA VI BEGINS GLOBAL ROLLOUT',
-    summary: 'GAMERS ENTER VICE CITY AFTER A 13-YEAR WAIT.',
-    icon: iconGamepad,
-  },
-  {
-    tag: 'USA', color: [15, 118, 110],
-    headline: 'JEFFRIES SET TO BE FIRST BLACK SPEAKER',
-    summary: 'DEMOCRATS NOMINATE HAKEEM JEFFRIES TO LEAD THE HOUSE.',
-    icon: iconGavel,
-  },
-];
-
-const RED: RGB = [176, 58, 46];
-const BLUE: RGB = [46, 94, 140];
-const TEAL: RGB = [15, 118, 110];
-const PURPLE: RGB = [109, 40, 217];
-const AMBER: RGB = [180, 83, 9];
-const SKY: RGB = [3, 105, 161];
-const GREEN: RGB = [21, 101, 52];
-
-const INDEX: IndexStory[] = [
-  { tag: 'EUROPE', color: BLUE, headline: 'EU PLANS 45BN UKRAINE LOAN FROM RUSSIAN CASH' },
-  { tag: 'EUROPE', color: BLUE, headline: '20+ LEADERS MEET IN BERLIN ON UKRAINE GUARANTEES' },
-  { tag: 'MIDEAST', color: RED, headline: 'IRAN WIDENS STRIKES TO KUWAIT AND HORMUZ SHIPS' },
-  { tag: 'MIDEAST', color: RED, headline: 'SAUDI ARABIA: ALL-CLEAR IN THREE SOUTHERN CITIES' },
-  { tag: 'MIDEAST', color: RED, headline: 'US SANCTIONS 3 FIRMS OVER HEZBOLLAH LINKS' },
-  { tag: 'MIDEAST', color: RED, headline: 'TANKER HIT IN HORMUZ, CREW SAFE' },
-  { tag: 'MIDEAST', color: RED, headline: 'AUSTRALIA SANCTIONS ISRAELI WEST BANK SETTLERS' },
-  { tag: 'EUROPE', color: BLUE, headline: 'LPG TANKER THAT SANK OFF BULGARIA WAS HIT BY SHELLS' },
-  { tag: 'MIDEAST', color: RED, headline: 'ISRAELI DRONE STRIKE KILLS TWO IN GAZA JABALIYA' },
-  { tag: 'AFRICA', color: GREEN, headline: 'SOMALIA ACCUSES UAE OF SECRET BASES ON ITS SOIL' },
-  { tag: 'AFRICA', color: GREEN, headline: 'NIGERIAN TROOPS KILL 21 SUSPECTED ISWAP FIGHTERS' },
-  { tag: 'AFRICA', color: GREEN, headline: 'COCAINE AND MILLIONS OF PILLS SEIZED IN EAST LIBYA' },
-  { tag: 'AMERICAS', color: PURPLE, headline: 'CANADA RECALIBRATES CHINA TIES, CARNEY SEEKS US DEAL' },
-  { tag: 'ASIA', color: TEAL, headline: 'XI OPENS APEC, URGES LOWER TRADE BARRIERS' },
-  { tag: 'ASIA', color: TEAL, headline: 'INDIA AND JAPAN REVIEW DEFENCE TIES IN TOKYO' },
-  { tag: 'ASIA', color: TEAL, headline: 'MODI MEETS WILLIAM AND KATE, BOOSTS UK TIES' },
-  { tag: 'AMERICAS', color: PURPLE, headline: 'LIU YUNPING ELECTED HOUSE DEMOCRATIC CAUCUS CHAIR' },
-  { tag: 'AMERICAS', color: PURPLE, headline: 'PELTOLA WINS ALASKA AS DEMS TAKE SENATE 56-44' },
-  { tag: 'AMERICAS', color: PURPLE, headline: 'US PLANS TOUGHER GREEN-CARD RULES' },
-  { tag: 'BUSINESS', color: AMBER, headline: 'FED MINUTES POINT TO MORE RATE HIKES' },
-  { tag: 'BUSINESS', color: AMBER, headline: 'INDONESIA HIKES RATES TO 6.0% TO PROP RUPIAH' },
-  { tag: 'BUSINESS', color: AMBER, headline: 'OIL FALLS 3.2% TO $83.26 AS WAR RISK SPOOKS MARKETS' },
-  { tag: 'BUSINESS', color: AMBER, headline: 'DOW FALLS 561 AS ROUT SPREADS TO ASIAN SHARES' },
-  { tag: 'TECH', color: SKY, headline: 'NVIDIA ACTING CEO PROMISES EARLIER PAY RAISES' },
-  { tag: 'TECH', color: SKY, headline: 'NVIDIA HALTS H-SERIES CHIP SHIPMENTS TO CHINA' },
-  { tag: 'TECH', color: SKY, headline: 'ANTHROPIC SETS IPO PRICE; EARLY BACKERS UP $100BN' },
-  { tag: 'TECH', color: SKY, headline: 'MICROSOFT IN TALKS TO SELL AI SERVICES TO BYTEDANCE' },
-  { tag: 'SCIENCE', color: TEAL, headline: 'VOYAGER 1 BELIEVED TO HIT ONE LIGHT-DAY MILESTONE' },
-  { tag: 'SCIENCE', color: TEAL, headline: 'WHY EARTH IS MISSING A BILLION YEARS' },
-  { tag: 'WORLD', color: NAVY, headline: "ISLAM TO BE WORLD'S LARGEST FAITH BY 2035: PEW" },
-  { tag: 'WEATHER', color: SKY, headline: 'CYCLONE AKVAN TO CROSS COAST NEAR PURI' },
-  { tag: 'TECH', color: SKY, headline: 'US SENATORS WARN AI CYBER THREATS OUTPACE DEFENCES' },
-  { tag: 'SPORT', color: GREEN, headline: 'ENGLAND BEAT AUSTRALIA BY 97 RUNS IN ODI DECIDER' },
-  { tag: 'SPORT', color: GREEN, headline: 'INDIA V NEW ZEALAND FIRST TEST BEGINS IN WELLINGTON' },
-  { tag: 'SPORT', color: GREEN, headline: 'HO CHI MINH CITY POLICE FC STUN BURIRAM UNITED 1-0' },
-];
-
-// -------------------------------------------------------------- draw ----
-
-function drawHero(story: HeroStory, x: number, y: number, w: number, h: number, n: number): void {
-  fill(x, y, w, h, WHITE);
-  fill(x, y, w, 2, INK); fill(x, y + h - 2, w, 2, INK);
-  fill(x, y, 2, h, INK); fill(x + w - 2, y, 2, h, INK);
-  // Tag bar.
-  fill(x + 2, y + 2, w - 4, 30, story.color);
-  drawText(story.tag, x + 14, y + 11, 2, WHITE);
-  drawText('TOP ' + n, x + w - 76, y + 11, 2, WHITE);
-  // Pictogram box, top right below the tag bar.
-  const ix = x + w - 80, iy = y + 42;
-  fill(ix, iy, 64, 64, [245, 242, 234]);
-  fill(ix, iy, 64, 2, story.color); fill(ix, iy + 62, 64, 2, story.color);
-  fill(ix, iy, 2, 64, story.color); fill(ix + 62, iy, 2, 64, story.color);
-  story.icon(ix - 3, iy - 3, story.color);
-  // Headline beside the pictogram, then summary full width.
-  const headLines = wrap(story.headline, 2, 196).slice(0, 4);
-  headLines.forEach((ln, i) => drawText(ln, x + 14, y + 44 + i * 17, 2, INK));
-  let cy = y + 44 + headLines.length * 17 + 8;
-  const sumLines = wrap(story.summary, 2, w - 28).slice(0, 3);
-  sumLines.forEach((ln, i) => drawText(ln, x + 14, cy + i * 17, 2, MUTED));
-  cy += sumLines.length * 17 + 10;
-  // Date rule at the foot; cy stays well above it by construction.
-  fill(x + 14, y + h - 30, w - 28, 2, LIGHT);
-  drawText('19 NOV 2026', x + 14, y + h - 22, 2, MUTED);
-  drawText('NO. ' + n, x + w - 62, y + h - 22, 2, MUTED);
+function paintTicker(b: Board): void {
+  const y0 = 432;
+  b.fill(0, y0, W, 24, NAVY);
+  putCentred(b, TICKER, W / 2, y0 + 8, 1, GOLD);
 }
 
-function drawIndexRow(story: IndexStory, x: number, y: number, w: number, n: number): void {
-  // Tag line (scale 1) then headline, at most 2 lines at scale 2.
-  drawText(String(n).padStart(2, '0') + '  ' + story.tag, x, y + 1, 1, story.color);
-  const lines = wrap(story.headline, 2, w).slice(0, 2);
-  if (wrap(story.headline, 2, w).length > 2) console.warn('headline overflows 2 lines: ' + story.headline);
-  lines.forEach((ln, i) => drawText(ln, x, y + 12 + i * 16, 2, INK));
-  fill(x, y + 44, w, 1, LIGHT);
-}
-
-function draw(): void {
-  fill(0, 0, W, H, PAPER);
-  // Masthead.
-  fill(0, 0, W, 138, NAVY);
-  fill(0, 138, W, 4, GOLD);
-  drawTextCentered('THE WORLD IN ONE DAY', W / 2, 16, 2, GOLD);
-  drawTextCentered('THURSDAY 19 NOVEMBER 2026', W / 2, 46, 4, WHITE);
-  drawTextCentered('38 STORIES FROM AROUND THE GLOBE', W / 2, 106, 2, [200, 205, 220]);
-  // Hero row: 3 panels.
-  const hw = 320, hh = 232, hy = 152;
-  HERO.forEach((s, i) => drawHero(s, 16 + i * (hw + 16), hy, hw, hh, i + 1));
-  // Index header.
-  drawText('THE DAY IN BRIEF', 16, 396, 2, NAVY);
-  drawText('35 MORE STORIES', 1024 - 16 - textWidth('35 MORE STORIES', 2), 396, 2, MUTED);
-  fill(16, 416, 992, 2, NAVY);
-  // Index: 3 columns, 12 rows each, row height 46.
-  const colW = 320, rowH = 44, topY = 424;
-  const perCol = 12;
-  INDEX.forEach((s, i) => {
-    const col = Math.floor(i / perCol), row = i % perCol;
-    drawIndexRow(s, 16 + col * (colW + 16), topY + row * rowH, colW, i + 4);
+function paintTimeline(b: Board): void {
+  const y0 = 464;
+  b.fill(0, y0, W, 44, NAVY);
+  putLine(b, 'UTC', 14, y0 + 8, 2, GOLD);
+  putLine(b, 'TIMELINE', 14, y0 + 26, 1, PALE);
+  const slot = (W - 130) / MARKS.length;
+  MARKS.forEach((ev, i) => {
+    const cx = 130 + slot * i + slot / 2;
+    b.ring(Math.round(cx), y0 + 10, 3, GOLD);
+    putCentred(b, ev.at, cx, y0 + 17, 1, WHITE);
+    const label = splitLines(ev.what, 1, Math.floor(slot) - 8);
+    label.slice(0, 2).forEach((ln, j) => putCentred(b, ln, cx, y0 + 26 + j * 9, 1, PALE));
   });
-  // Footer.
-  drawTextCentered('FIRST REPORTED THURSDAY 19 NOVEMBER 2026', W / 2, 972, 2, MUTED);
-  drawTextCentered('ASIA - EUROPE - AMERICAS - MIDEAST - AFRICA - TECH - SPORT', W / 2, 996, 1, MUTED);
+}
+
+function paintIndex(b: Board): void {
+  const y0 = 516;
+  const colW = 242;
+  const gap = 10;
+  const x0 = 12;
+  putLine(b, 'THE REST OF THE DAY - 132 MORE STORIES', x0, y0, 2, INK);
+  b.fill(x0, y0 + 20, W - 24, 2, INK);
+  // Two region blocks per column, four columns.
+  const columns: (typeof GRID)[] = [
+    [GRID[0], GRID[1]],
+    [GRID[2], GRID[3]],
+    [GRID[4], GRID[5]],
+    [GRID[6], GRID[7]],
+  ];
+  columns.forEach((blocks, ci) => {
+    const cx = x0 + ci * (colW + gap);
+    let y = y0 + 32;
+    let num = 0;
+    for (const block of blocks) {
+      const hue = HUES[block.hue];
+      putLine(b, block.name, cx, y, 1, hue);
+      b.fill(cx, y + 10, colW, 2, hue);
+      y += 15;
+      for (const item of block.lines) {
+        num++;
+        const label = String(num).padStart(2, '0') + ' ' + item;
+        putLine(b, label, cx, y, 1, INK);
+        y += 10;
+      }
+      y += 6;
+    }
+  });
+}
+
+function paintFooter(b: Board): void {
+  const y0 = 964;
+  b.fill(0, y0, W, 2, GOLD);
+  putCentred(b, 'DATE CHECK: EVERY STORY FIRST REPORTED THU 19 NOV 2026', W / 2, y0 + 10, 2, INK);
+  putCentred(b, 'SOURCES: ' + SOURCE_LINE, W / 2, y0 + 32, 1, MUTED);
+  putCentred(b, 'DRAWN IN CODE - 1024 X 1024 - NO PHOTOS, NO NETWORK', W / 2, y0 + 44, 1, MUTED);
+}
+
+function paintPoster(): Board {
+  const b = new Board();
+  b.fill(0, 0, W, H, PAPER);
+  paintMasthead(b);
+  // Lead grid: 4 columns x 2 rows.
+  const pw = 244;
+  const ph = 152;
+  LEADS.forEach((lead, i) => {
+    const col = i % 4;
+    const row = Math.floor(i / 4);
+    paintLead(b, lead, 12 + col * (pw + 8), 112 + row * (ph + 8), pw, ph, i + 1);
+  });
+  paintTicker(b);
+  paintTimeline(b);
+  paintIndex(b);
+  paintFooter(b);
+  return b;
 }
 
 // ---------------------------------------------------------------- main ---
 
-draw();
+const board = paintPoster();
 const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-mkdirSync(outDir, { recursive: true });
-writeFileSync(join(outDir, 'entry.png'), encodePng(px, W, H));
+fs.mkdirSync(outDir, { recursive: true });
+fs.writeFileSync(path.join(outDir, 'entry.png'), toPng(board.data, W, H));
